@@ -4,14 +4,14 @@ from .base import BaseInterceptor
 
 # Support Python 2/3
 try:
-    import mock
+    import mock as m
 except Exception:
-    from unittest import mock
+    from unittest import mock as m
 
-if sys.version_info < (3,):     # Python 2
+if sys.version_info < (3, ):  # Python 2
     from urlparse import urlunparse
     from httplib import responses as http_reasons
-else:                           # Python 3
+else:  # Python 3
     from urllib.parse import urlunparse
     from http.client import responses as http_reasons
 
@@ -27,9 +27,7 @@ try:
 except Exception:
     yarl, multidict = None, None
 
-PATCHES = (
-    'aiohttp.client.ClientSession._request',
-)
+PATCHES = ('aiohttp.client.ClientSession._request', )
 
 RESPONSE_CLASS = 'ClientResponse'
 RESPONSE_PATH = 'aiohttp.client_reqrep'
@@ -37,8 +35,22 @@ RESPONSE_PATH = 'aiohttp.client_reqrep'
 
 def HTTPResponse(*args, **kw):
     # Dynamically load package
-    module = __import__(RESPONSE_PATH, fromlist=(RESPONSE_CLASS,))
+    module = __import__(RESPONSE_PATH, fromlist=(RESPONSE_CLASS, ))
     ClientResponse = getattr(module, RESPONSE_CLASS)
+
+    from aiohttp.helpers import TimerNoop
+
+    kw['request_info'] = m.Mock(
+        method=args[0],
+        url=args[1],
+    )
+
+    kw['writer'] = m.Mock()
+    kw['continue100'] = None
+    kw['timer'] = TimerNoop()
+    kw['traces'] = []
+    kw['loop'] = m.Mock()
+    kw['session'] = None
 
     # Return response instance
     return ClientResponse(*args, **kw)
@@ -48,13 +60,17 @@ class AIOHTTPInterceptor(BaseInterceptor):
     """
     aiohttp HTTP client traffic interceptor.
     """
-
     def _url(self, url):
         return yarl.URL(url) if yarl else None
 
-    @asyncio.coroutine
-    def _on_request(self, _request, session, method, url,
-                    data=None, headers=None, **kw):
+    async def _on_request(self,
+                          _request,
+                          session,
+                          method,
+                          url,
+                          data=None,
+                          headers=None,
+                          **kw):
         # Create request contract based on incoming params
         req = Request(method)
         req.headers = headers or {}
@@ -73,12 +89,16 @@ class AIOHTTPInterceptor(BaseInterceptor):
         # or silent model are enabled, otherwise this statement won't
         # be reached (an exception will be raised before).
         if not mock:
-            return _request(session, method, url,
-                            data=data, headers=headers, **kw)
+            return _request(session,
+                            method,
+                            url,
+                            data=data,
+                            headers=headers,
+                            **kw)
 
         # Simulate network delay
         if mock._delay:
-            yield from asyncio.sleep(mock._delay / 1000)  # noqa
+            await asyncio.sleep(mock._delay / 1000)  # noqa
 
         # Shortcut to mock response
         res = mock._response
@@ -89,7 +109,10 @@ class AIOHTTPInterceptor(BaseInterceptor):
             headers.append((key, res._headers[key]))
 
         # Create mock equivalent HTTP response
-        _res = HTTPResponse(req.method, self._url(urlunparse(req.url)))
+        _res = HTTPResponse(
+            req.method,
+            self._url(urlunparse(req.url)),
+        )
 
         # response status
         _res.version = (1, 1)
@@ -98,16 +121,17 @@ class AIOHTTPInterceptor(BaseInterceptor):
         _res._should_close = False
 
         # Add response headers
-        _res.raw_headers = tuple(headers)
-        _res.headers = multidict.CIMultiDictProxy(
-            multidict.CIMultiDict(headers)
-        )
+        _res._raw_headers = tuple(headers)
+        _res._headers = multidict.CIMultiDictProxy(
+            multidict.CIMultiDict(headers))
 
         # Define `_content` attribute with an empty string to
         # force do not read from stream (which won't exists)
-        _res._content = ''
+        _res.content = asyncio.StreamReader()
         if res._body:
-            _res._content = res._body.encode('utf-8', errors='replace')
+            _res.content = asyncio.StreamReader()
+            _res.content.feed_data(res._body.encode('utf-8', errors='replace'))
+            _res.content.feed_eof()
 
         # Return response based on mock definition
         return _res
@@ -117,17 +141,19 @@ class AIOHTTPInterceptor(BaseInterceptor):
         if not asyncio:
             return None
 
-        @asyncio.coroutine
-        def handler(session, method, url, data=None, headers=None, **kw):
-            return (yield from self._on_request(
-                _request, session, method, url,
-                data=data, headers=headers, **kw)
-            )
+        async def handler(session, method, url, data=None, headers=None, **kw):
+            return (await self._on_request(_request,
+                                                session,
+                                                method,
+                                                url,
+                                                data=data,
+                                                headers=headers,
+                                                **kw))
 
         try:
             # Create a new patcher for Urllib3 urlopen function
             # used as entry point for all the HTTP communications
-            patcher = mock.patch(path, handler)
+            patcher = m.patch(path, handler)
             # Retrieve original patched function that we might need for real
             # networking
             _request = patcher.get_original()[0]
